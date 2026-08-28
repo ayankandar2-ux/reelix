@@ -18,7 +18,7 @@ import concurrent.futures
 import urllib.error
 import urllib.request
 
-DEFAULT_TIMEOUT = 4.0
+DEFAULT_TIMEOUT = 1.8
 DEFAULT_MAX_WORKERS = 6
 
 

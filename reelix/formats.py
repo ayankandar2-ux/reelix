@@ -26,7 +26,20 @@ def _bucket_height(height: int) -> int:
     return best if height >= STANDARD_HEIGHTS[0] else height
 
 
-def _format_size(fmt: dict) -> tuple[float | None, bool]:
+def _estimate_from_bitrate(fmt: dict, duration: float | None) -> float | None:
+    """Estimate size from bitrate * duration when yt-dlp gave us neither
+    filesize nor filesize_approx (common for DASH formats on sites like
+    Instagram/Facebook that don't publish per-format sizes). tbr/vbr/abr
+    are kbit/s, so bytes = kbit/s * 1000 / 8 * seconds."""
+    if not duration or duration <= 0:
+        return None
+    rate = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
+    if not rate or rate <= 0:
+        return None
+    return float(rate) * 125.0 * float(duration)
+
+
+def _format_size(fmt: dict, duration: float | None = None) -> tuple[float | None, bool]:
     """Return (size_bytes, is_approximate) for a single format."""
     exact = fmt.get("filesize")
     if exact:
@@ -34,6 +47,9 @@ def _format_size(fmt: dict) -> tuple[float | None, bool]:
     approx = fmt.get("filesize_approx")
     if approx:
         return float(approx), True
+    estimated = _estimate_from_bitrate(fmt, duration)
+    if estimated:
+        return estimated, True
     return None, True
 
 
@@ -100,12 +116,12 @@ class QualityOption:
         return v_approx or a_approx
 
 
-def _parse_streams(formats: list[dict]) -> list[StreamInfo]:
+def _parse_streams(formats: list[dict], duration: float | None = None) -> list[StreamInfo]:
     streams = []
     for fmt in formats:
         if fmt.get("format_id") is None:
             continue
-        size, approx = _format_size(fmt)
+        size, approx = _format_size(fmt, duration)
         streams.append(
             StreamInfo(
                 format_id=str(fmt.get("format_id")),
@@ -125,10 +141,10 @@ def _parse_streams(formats: list[dict]) -> list[StreamInfo]:
     return streams
 
 
-def parse_streams(formats: list[dict]) -> list[StreamInfo]:
+def parse_streams(formats: list[dict], duration: float | None = None) -> list[StreamInfo]:
     """Public entry point for turning raw yt-dlp format dicts into
     StreamInfo objects."""
-    return _parse_streams(formats)
+    return _parse_streams(formats, duration)
 
 
 def best_audio_stream(streams: list[StreamInfo]) -> StreamInfo | None:
@@ -176,7 +192,8 @@ def build_quality_options(info: dict) -> tuple[list[QualityOption], list[Quality
     other resolution bucket that exists (e.g. 144p, 240p, 1080p, 1440p...).
     """
     formats = info.get("formats") or []
-    streams = _parse_streams(formats)
+    duration = info.get("duration")
+    streams = _parse_streams(formats, duration)
     audio = best_audio_stream(streams)
     buckets = available_buckets(streams)
 
@@ -206,7 +223,8 @@ def build_quality_options(info: dict) -> tuple[list[QualityOption], list[Quality
 def build_advanced_table(info: dict) -> list[StreamInfo]:
     """Every real format yt-dlp reported, for the raw Advanced view."""
     formats = info.get("formats") or []
-    streams = _parse_streams(formats)
+    duration = info.get("duration")
+    streams = _parse_streams(formats, duration)
     # Show video streams first (highest to lowest), then audio-only.
     video_streams = sorted(
         (s for s in streams if s.is_video),

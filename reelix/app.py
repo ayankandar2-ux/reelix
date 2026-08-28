@@ -8,6 +8,7 @@ Screen flow:
 from __future__ import annotations
 
 import curses
+import re
 import sys
 import threading
 import time
@@ -24,7 +25,7 @@ from .errors import ReelixError, check_dependencies
 from .utils import format_duration, format_eta, human_size, human_speed, looks_like_url
 
 BOX_WIDTH = 56
-ADVANCED_PROBE_MAX_WAIT = 6.0  # seconds we'll auto-refresh the screen while probing
+ADVANCED_PROBE_MAX_WAIT = 3.0  # seconds we'll auto-refresh the screen while probing
 
 
 class AppState:
@@ -337,6 +338,23 @@ def _advanced_still_probing(state: AppState) -> bool:
     return any(s.probing for s in state.advanced_streams)
 
 
+def _short_format_id(format_id: str, max_len: int = 7) -> str:
+    """Some sites (Instagram, Facebook) hand back format IDs that are a huge
+    opaque number plus a short readable tag, e.g.
+    'dash-18113169793891943v720p' or 'dash-18113159506891943aaudio'.
+    Showing the whole thing just fills the column with noise the user can't
+    tell apart. Trim to the trailing letters+digits run that starts with a
+    letter (the readable tag) -- falls back to the full id untouched for
+    normal short/simple ids like '137' that have nothing to trim."""
+    if len(format_id) <= max_len:
+        return format_id
+    match = re.search(r"[a-zA-Z][a-zA-Z0-9]*$", format_id)
+    tail = match.group(0) if match else format_id
+    if len(tail) > max_len:
+        tail = tail[-max_len:]
+    return tail
+
+
 def _draw_advanced_table(stdscr, state: AppState, color_enabled: bool, x: int, y: int, width: int) -> int:
     streams = state.advanced_streams
     visible = min(len(streams), max(4, stdscr.getmaxyx()[0] - 8))
@@ -361,7 +379,8 @@ def _draw_advanced_table(stdscr, state: AppState, color_enabled: bool, x: int, y
             size_txt = "measuring..."
         else:
             size_txt = "unknown"
-        line = f"{s.format_id:<7}{res:<8}{fps:<6}{s.ext:<6}{codec:<10}{size_txt:<10}"
+        short_id = _short_format_id(s.format_id)
+        line = f"{short_id:<7}{res:<8}{fps:<6}{s.ext:<6}{codec:<10}{size_txt:<10}"
         is_selected = i == state.selected_index
         line_attr = ui.attr(color_enabled, ui.COLOR_SUCCESS, bold=True) if is_selected else ui.attr(color_enabled, ui.COLOR_MUTED)
         marker = "\u25b8 " if is_selected else "  "
@@ -410,7 +429,7 @@ def _screen_advanced(stdscr, state: AppState, color_enabled: bool) -> str:
         chosen = streams[state.selected_index]
         if chosen.is_video and not chosen.is_audio:
             audio = fmt_module.best_audio_stream(
-                fmt_module.parse_streams(state.info.get("formats") or [])
+                fmt_module.parse_streams(state.info.get("formats") or [], (state.info or {}).get("duration"))
             )
             selector = f"{chosen.format_id}+{audio.format_id}" if audio else chosen.format_id
         else:
@@ -479,13 +498,12 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     ui.safe_addstr(stdscr, y + 3, x + 2, "Format", label_attr)
     ui.safe_addstr(stdscr, y + 3, x + 13, result.get("container", "-"), value_attr)
 
-    percent = 0.0
-    downloaded = 0.0
-    total = 0.0
-    speed = None
-    eta = None
-    stage = "Starting..."
-
+    # Drain whatever's queued so `dl.done`/error state is current -- the
+    # authoritative progress numbers themselves now live on dl directly
+    # (see Download._apply), updated the instant _pump parses a line, so
+    # a redraw always has the latest known values instead of resetting
+    # to blank whenever this call's poll window doesn't happen to catch
+    # a fresh event.
     stdscr.nodelay(True)
     deadline = time.time() + 0.5
     while time.time() < deadline:
@@ -494,19 +512,24 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
             if dl.done:
                 break
             continue
-        if event.kind == "progress":
-            percent = event.percent or percent
-            downloaded = event.downloaded_bytes or downloaded
-            total = event.total_bytes or total
-            speed = event.speed_bytes
-            eta = event.eta_seconds
-            stage = "Downloading"
-        elif event.kind == "merging":
-            stage = "Merging with FFmpeg..."
-        elif event.kind == "finished":
+        if event.kind == "finished":
             break
         if dl.done and dl.events.empty():
             break
+
+    percent = dl.percent
+    downloaded = dl.downloaded_bytes
+    total = dl.total_bytes
+    speed = dl.speed_bytes
+    eta = dl.eta_seconds
+    stage = dl.stage
+
+    if stage == "Starting..." and percent == 0.0:
+        # No status line has arrived yet (still connecting/handshaking).
+        # Show a small animated spinner so the screen visibly changes
+        # instead of sitting dead-still during that gap.
+        spinner = "|/-\\"[int(time.time() * 4) % 4]
+        stage = f"Starting... {spinner}"
 
     size_line = f"{human_size(downloaded)} / {human_size(total)}" if total else stage
     ui.safe_addstr(stdscr, y + 5, x + 2, size_line, ui.attr(color_enabled, ui.COLOR_MUTED))

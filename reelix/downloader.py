@@ -52,6 +52,21 @@ class Download:
         self.done = False
         self.error: ReelixError | None = None
         self.returncode: int | None = None
+
+        # Latest known state, updated directly from _pump as events are
+        # parsed -- kept here (not just in the queue) so the UI always has
+        # something current to draw even if a redraw's poll window misses
+        # the exact moment an event was queued. Without this the display
+        # was resetting to blank/zero on every redraw that didn't happen
+        # to catch an event, making it look frozen even while the file
+        # was actually growing on disk.
+        self.percent = 0.0
+        self.downloaded_bytes = 0.0
+        self.total_bytes = 0.0
+        self.speed_bytes: float | None = None
+        self.eta_seconds: float | None = None
+        self.stage = "Starting..."
+
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stderr_lines: list[str] = []
@@ -86,8 +101,7 @@ class Download:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                bufsize=0,
             )
         except FileNotFoundError as exc:
             self.error = ReelixError("yt-dlp missing", "yt-dlp isn't on your PATH.")
@@ -98,11 +112,37 @@ class Download:
         self._thread.start()
 
     def _pump(self) -> None:
+        """Read the subprocess output byte-by-byte and split on either
+        '\\n' or a bare '\\r'. aria2c redraws its progress line in place
+        using '\\r' with no trailing '\\n' -- reading in text mode with
+        Python's default line iteration can leave that update sitting in
+        the pipe buffer until something else forces a newline through,
+        which is what made the UI look frozen even though the download
+        was progressing. Reacting to '\\r' immediately fixes that."""
         assert self._proc is not None and self._proc.stdout is not None
-        for raw_line in self._proc.stdout:
+        buf = bytearray()
+        stream = self._proc.stdout
+        while True:
+            chunk = stream.read(1)
+            if not chunk:
+                break
+            if chunk in (b"\n", b"\r"):
+                if buf:
+                    raw_line = buf.decode("utf-8", errors="replace")
+                    self._stderr_lines.append(raw_line)
+                    event = parse_line(raw_line)
+                    if event is not None:
+                        self._apply(event)
+                        self.events.put(event)
+                    buf.clear()
+            else:
+                buf += chunk
+        if buf:
+            raw_line = buf.decode("utf-8", errors="replace")
             self._stderr_lines.append(raw_line)
             event = parse_line(raw_line)
             if event is not None:
+                self._apply(event)
                 self.events.put(event)
         self._proc.wait()
         self.returncode = self._proc.returncode
@@ -110,6 +150,21 @@ class Download:
             self.error = map_ytdlp_error("".join(self._stderr_lines))
         self.done = True
         self.events.put(ProgressEvent(kind="finished"))
+
+    def _apply(self, event: ProgressEvent) -> None:
+        """Update the persistent latest-state snapshot from a parsed event."""
+        if event.kind == "progress":
+            if event.percent is not None:
+                self.percent = event.percent
+            if event.downloaded_bytes is not None:
+                self.downloaded_bytes = event.downloaded_bytes
+            if event.total_bytes is not None:
+                self.total_bytes = event.total_bytes
+            self.speed_bytes = event.speed_bytes
+            self.eta_seconds = event.eta_seconds
+            self.stage = "Downloading"
+        elif event.kind == "merging":
+            self.stage = "Merging with FFmpeg..."
 
     def poll(self, timeout: float = 0.2) -> ProgressEvent | None:
         try:
