@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from pathlib import Path
 from queue import Empty, Queue
 
@@ -66,6 +67,15 @@ class Download:
         self.speed_bytes: float | None = None
         self.eta_seconds: float | None = None
         self.stage = "Starting..."
+        # Timestamp of the last _apply() update, so the UI can extrapolate
+        # smooth in-between progress at its own redraw rate instead of only
+        # visibly moving on the rare occasions aria2c itself prints a line
+        # (which can be as infrequent as one line total for a small/fast
+        # download that finishes in under a second).
+        self.last_update_time: float = time.monotonic()
+        self._start_time: float = time.monotonic()
+        self._last_sample_time: float | None = None
+        self._last_sample_bytes: float = 0.0
 
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
@@ -152,19 +162,44 @@ class Download:
         self.events.put(ProgressEvent(kind="finished"))
 
     def _apply(self, event: ProgressEvent) -> None:
-        """Update the persistent latest-state snapshot from a parsed event."""
+        """Update the persistent latest-state snapshot from a parsed event.
+
+        Speed/ETA are computed here from our own byte-delta samples rather
+        than trusted verbatim from aria2c's line, because aria2c only
+        prints roughly once a second -- a small/fast download can finish
+        inside that window and produce exactly one line (the 100% one)
+        with no speed/ETA fields on it at all. Sampling ourselves means we
+        always have a number, even for downloads too quick for aria2c to
+        report on."""
+        now = time.monotonic()
         if event.kind == "progress":
-            if event.percent is not None:
-                self.percent = event.percent
             if event.downloaded_bytes is not None:
-                self.downloaded_bytes = event.downloaded_bytes
+                new_bytes = event.downloaded_bytes
+                if self._last_sample_time is not None:
+                    dt = now - self._last_sample_time
+                    dbytes = new_bytes - self._last_sample_bytes
+                    if dt > 0.05 and dbytes >= 0:
+                        self.speed_bytes = dbytes / dt
+                elif event.speed_bytes:
+                    # First sample: nothing to diff against yet, so use
+                    # aria2c's own reported speed if it gave us one.
+                    self.speed_bytes = event.speed_bytes
+                self._last_sample_time = now
+                self._last_sample_bytes = new_bytes
+                self.downloaded_bytes = new_bytes
             if event.total_bytes is not None:
                 self.total_bytes = event.total_bytes
-            self.speed_bytes = event.speed_bytes
-            self.eta_seconds = event.eta_seconds
+            if event.percent is not None:
+                self.percent = event.percent
+            if self.speed_bytes and self.total_bytes:
+                remaining = max(self.total_bytes - self.downloaded_bytes, 0.0)
+                self.eta_seconds = remaining / self.speed_bytes if self.speed_bytes > 0 else None
+            elif event.eta_seconds is not None:
+                self.eta_seconds = event.eta_seconds
             self.stage = "Downloading"
         elif event.kind == "merging":
             self.stage = "Merging with FFmpeg..."
+        self.last_update_time = now
 
     def poll(self, timeout: float = 0.2) -> ProgressEvent | None:
         try:

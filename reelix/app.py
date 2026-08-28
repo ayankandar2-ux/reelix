@@ -524,6 +524,17 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     eta = dl.eta_seconds
     stage = dl.stage
 
+    if stage == "Downloading" and speed and total and not dl.done:
+        # aria2c only prints roughly once a second -- extrapolate forward
+        # from the last real sample at our own redraw rate so the bar
+        # visibly climbs continuously instead of sitting still and then
+        # jumping straight to the next real number. Purely a display
+        # smoothing pass -- dl's own state is untouched, so a stale guess
+        # can never compound into the real tracked total.
+        elapsed = min(max(0.0, time.monotonic() - dl.last_update_time), 2.0)
+        downloaded = min(total, downloaded + speed * elapsed)
+        percent = (downloaded / total) * 100.0
+
     if stage == "Starting..." and percent == 0.0:
         # No status line has arrived yet (still connecting/handshaking).
         # Show a small animated spinner so the screen visibly changes
