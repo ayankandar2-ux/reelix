@@ -49,6 +49,9 @@ class StreamInfo:
     abr: float | None = None
     size_bytes: float | None = None
     size_approx: bool = True
+    url: str | None = None
+    http_headers: dict | None = None
+    probing: bool = False
 
     @property
     def is_video(self) -> bool:
@@ -115,6 +118,8 @@ def _parse_streams(formats: list[dict]) -> list[StreamInfo]:
                 abr=fmt.get("abr"),
                 size_bytes=size,
                 size_approx=approx,
+                url=fmt.get("url"),
+                http_headers=fmt.get("http_headers"),
             )
         )
     return streams

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import formats as fmt_module
 from . import metadata
+from . import sizeprobe
 from . import storage
 from . import ui
 from .config import load_config, save_config
@@ -23,6 +24,7 @@ from .errors import ReelixError, check_dependencies
 from .utils import format_duration, format_eta, human_size, human_speed, looks_like_url
 
 BOX_WIDTH = 56
+ADVANCED_PROBE_MAX_WAIT = 6.0  # seconds we'll auto-refresh the screen while probing
 
 
 class AppState:
@@ -38,6 +40,8 @@ class AppState:
         self.download: Download | None = None
         self.debug = config.get("debug", False)
         self.last_result: dict | None = None
+        self.advanced_probe_started = False
+        self.advanced_probe_thread: threading.Thread | None = None
 
 
 def run() -> None:
@@ -193,6 +197,8 @@ def _screen_fetching(stdscr, state: AppState, color_enabled: bool) -> str:
     state.normal_options, state.advanced_options = fmt_module.build_quality_options(info)
     state.advanced_streams = fmt_module.build_advanced_table(info)
     state.selected_index = 0
+    state.advanced_probe_started = False
+    state.advanced_probe_thread = None
 
     if not state.normal_options and not state.advanced_options:
         state.error = ReelixError(
@@ -313,14 +319,27 @@ def _screen_quality_select(stdscr, state: AppState, color_enabled: bool) -> str:
 # Advanced formats
 # ---------------------------------------------------------------------------
 
-def _screen_advanced(stdscr, state: AppState, color_enabled: bool) -> str:
-    max_y, max_x = stdscr.getmaxyx()
-    width = min(max_x - 2, 68)
-    x = ui.center_x(max_x, width)
-    y = 1
+def _ensure_advanced_probe_started(state: AppState) -> None:
+    if state.advanced_probe_started:
+        return
+    state.advanced_probe_started = True
+    sizeprobe.mark_probing(state.advanced_streams)
+    thread = threading.Thread(
+        target=sizeprobe.probe_sizes,
+        args=(state.advanced_streams,),
+        daemon=True,
+    )
+    state.advanced_probe_thread = thread
+    thread.start()
 
+
+def _advanced_still_probing(state: AppState) -> bool:
+    return any(s.probing for s in state.advanced_streams)
+
+
+def _draw_advanced_table(stdscr, state: AppState, color_enabled: bool, x: int, y: int, width: int) -> int:
     streams = state.advanced_streams
-    visible = min(len(streams), max(4, max_y - 8))
+    visible = min(len(streams), max(4, stdscr.getmaxyx()[0] - 8))
     box_height = visible + 5
     ui.draw_box(stdscr, y, x, box_height, width, title="ADVANCED FORMATS", color_enabled=color_enabled)
 
@@ -336,7 +355,12 @@ def _screen_advanced(stdscr, state: AppState, color_enabled: bool) -> str:
         fps = f"{int(s.fps)}" if s.fps else "-"
         codec = s.vcodec if s.is_video else s.acodec
         codec = codec.split(".")[0] if codec else "-"
-        size_txt = ("~" if s.size_approx else "") + human_size(s.size_bytes)
+        if s.size_bytes is not None:
+            size_txt = ("~" if s.size_approx else "") + human_size(s.size_bytes)
+        elif s.probing:
+            size_txt = "measuring..."
+        else:
+            size_txt = "unknown"
         line = f"{s.format_id:<7}{res:<8}{fps:<6}{s.ext:<6}{codec:<10}{size_txt:<10}"
         is_selected = i == state.selected_index
         line_attr = ui.attr(color_enabled, ui.COLOR_SUCCESS, bold=True) if is_selected else ui.attr(color_enabled, ui.COLOR_MUTED)
@@ -349,8 +373,35 @@ def _screen_advanced(stdscr, state: AppState, color_enabled: bool) -> str:
                     "[\u2191\u2193] Select  [Enter] Download  [B] Back  [Q] Quit",
                     ui.attr(color_enabled, ui.COLOR_MUTED))
     stdscr.refresh()
+    return box_height
 
-    ch = stdscr.getch()
+
+def _screen_advanced(stdscr, state: AppState, color_enabled: bool) -> str:
+    max_y, max_x = stdscr.getmaxyx()
+    width = min(max_x - 2, 68)
+    x = ui.center_x(max_x, width)
+    y = 1
+
+    streams = state.advanced_streams
+    _ensure_advanced_probe_started(state)
+    _draw_advanced_table(stdscr, state, color_enabled, x, y, width)
+
+    # While sizes are still being measured, auto-refresh the table so
+    # results appear live without the user needing to press a key.
+    ch = -1
+    if _advanced_still_probing(state):
+        stdscr.timeout(150)
+        deadline = time.time() + ADVANCED_PROBE_MAX_WAIT
+        while _advanced_still_probing(state) and time.time() < deadline:
+            ch = stdscr.getch()
+            if ch != -1:
+                break
+            _draw_advanced_table(stdscr, state, color_enabled, x, y, width)
+        stdscr.timeout(-1)  # back to blocking
+
+    if ch == -1:
+        ch = stdscr.getch()
+
     if ch in (curses.KEY_UP, ord('k')):
         state.selected_index = (state.selected_index - 1) % len(streams)
     elif ch in (curses.KEY_DOWN, ord('j')):
