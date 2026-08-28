@@ -15,9 +15,12 @@ always a specific, explicitly-chosen pair of format IDs -- never the
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
+import struct
 import subprocess
+import termios
 import threading
 import time
 from pathlib import Path
@@ -118,6 +121,18 @@ class Download:
             # makes it believe it's attached to a real terminal, same as
             # running it by hand, so it keeps printing live updates.
             master_fd, slave_fd = pty.openpty()
+            # A freshly-opened pty reports a raw kernel size of 0x0 rows/
+            # cols until something explicitly sets it -- confirmed directly
+            # against this exact pty setup. A C program like aria2c reading
+            # that via ioctl(TIOCGWINSZ) sees 0x0 and doesn't treat it as a
+            # real usable terminal, so it holds back its live progress
+            # redraw even though isatty() itself already says true. Giving
+            # it a normal-looking size fixes that.
+            try:
+                winsize = struct.pack("HHHH", 40, 120, 0, 0)
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+            except OSError:
+                pass
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=slave_fd,
