@@ -15,6 +15,8 @@ always a specific, explicitly-chosen pair of format IDs -- never the
 """
 from __future__ import annotations
 
+import os
+import pty
 import subprocess
 import threading
 import time
@@ -78,6 +80,7 @@ class Download:
         self._last_sample_bytes: float = 0.0
 
         self._proc: subprocess.Popen | None = None
+        self._master_fd: int | None = None
         self._thread: threading.Thread | None = None
         self._stderr_lines: list[str] = []
         self._cancelled = False
@@ -107,12 +110,22 @@ class Download:
     def start(self) -> None:
         cmd = self._build_command()
         try:
+            # A plain pipe makes aria2c think nothing is watching in real
+            # time, so it holds back its live per-second status line and
+            # may only flush a line at the very end (or barely at all on
+            # a big download) -- that's what made progress look dead even
+            # though the file was genuinely growing. A pseudo-terminal
+            # makes it believe it's attached to a real terminal, same as
+            # running it by hand, so it keeps printing live updates.
+            master_fd, slave_fd = pty.openpty()
             self._proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
             )
+            os.close(slave_fd)
+            self._master_fd = master_fd
         except FileNotFoundError as exc:
             self.error = ReelixError("yt-dlp missing", "yt-dlp isn't on your PATH.")
             self.done = True
@@ -122,18 +135,22 @@ class Download:
         self._thread.start()
 
     def _pump(self) -> None:
-        """Read the subprocess output byte-by-byte and split on either
-        '\\n' or a bare '\\r'. aria2c redraws its progress line in place
-        using '\\r' with no trailing '\\n' -- reading in text mode with
-        Python's default line iteration can leave that update sitting in
-        the pipe buffer until something else forces a newline through,
-        which is what made the UI look frozen even though the download
-        was progressing. Reacting to '\\r' immediately fixes that."""
-        assert self._proc is not None and self._proc.stdout is not None
+        """Read the subprocess output (via its pseudo-terminal) byte-by-byte
+        and split on either '\\n' or a bare '\\r'. aria2c redraws its
+        progress line in place using '\\r' with no trailing '\\n' --
+        reacting to it immediately means we never wait on a newline that
+        might not come until the whole download finishes."""
+        assert self._proc is not None and self._master_fd is not None
         buf = bytearray()
-        stream = self._proc.stdout
+        fd = self._master_fd
         while True:
-            chunk = stream.read(1)
+            try:
+                chunk = os.read(fd, 1)
+            except OSError:
+                # A pty raises EIO once the slave side has been closed by
+                # the child exiting -- that's the normal end-of-output
+                # signal for a pty, not an error.
+                break
             if not chunk:
                 break
             if chunk in (b"\n", b"\r"):
@@ -154,6 +171,10 @@ class Download:
             if event is not None:
                 self._apply(event)
                 self.events.put(event)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         self._proc.wait()
         self.returncode = self._proc.returncode
         if self.returncode != 0 and not self._cancelled:
