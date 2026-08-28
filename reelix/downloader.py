@@ -18,6 +18,7 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
+import re
 import struct
 import subprocess
 import termios
@@ -28,6 +29,17 @@ from queue import Empty, Queue
 
 from .errors import ReelixError, map_ytdlp_error
 from .progress import ProgressEvent, parse_line
+
+# aria2c only sends color codes once it believes it's attached to a real
+# terminal -- which, now that it's on a proper pty with a real winsize, it
+# does. curses doesn't interpret those codes; it just prints the raw escape
+# bytes as literal garbage (the "^[[35m" mess). Stripping them before we
+# store/display or parse a line keeps the output clean either way.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 class Download:
@@ -170,22 +182,24 @@ class Download:
                 break
             if chunk in (b"\n", b"\r"):
                 if buf:
-                    raw_line = buf.decode("utf-8", errors="replace")
-                    self._stderr_lines.append(raw_line)
-                    event = parse_line(raw_line)
-                    if event is not None:
-                        self._apply(event)
-                        self.events.put(event)
+                    raw_line = self._clean_line(buf)
+                    if raw_line:
+                        self._stderr_lines.append(raw_line)
+                        event = parse_line(raw_line)
+                        if event is not None:
+                            self._apply(event)
+                            self.events.put(event)
                     buf.clear()
             else:
                 buf += chunk
         if buf:
-            raw_line = buf.decode("utf-8", errors="replace")
-            self._stderr_lines.append(raw_line)
-            event = parse_line(raw_line)
-            if event is not None:
-                self._apply(event)
-                self.events.put(event)
+            raw_line = self._clean_line(buf)
+            if raw_line:
+                self._stderr_lines.append(raw_line)
+                event = parse_line(raw_line)
+                if event is not None:
+                    self._apply(event)
+                    self.events.put(event)
         try:
             os.close(fd)
         except OSError:
@@ -196,6 +210,16 @@ class Download:
             self.error = map_ytdlp_error("".join(self._stderr_lines))
         self.done = True
         self.events.put(ProgressEvent(kind="finished"))
+
+    @staticmethod
+    def _clean_line(buf: bytearray) -> str:
+        """Decode a captured line, strip ANSI color codes, and drop
+        anything left over that isn't real printable text (e.g. a stray
+        control character that ended up split into its own buffered
+        "line" -- those showed up as lone junk lines in the raw view)."""
+        text = _strip_ansi(buf.decode("utf-8", errors="replace"))
+        text = "".join(ch for ch in text if ch.isprintable() or ch == "\t")
+        return text if text.strip() else ""
 
     def _apply(self, event: ProgressEvent) -> None:
         """Update the persistent latest-state snapshot from a parsed event.
