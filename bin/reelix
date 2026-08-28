@@ -1,0 +1,16 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+# Launcher for Reelix -- Universal Video Downloader.
+# Installed by install.sh; do not move this file without re-running install.sh.
+
+set -euo pipefail
+
+REELIX_HOME="${REELIX_HOME:-$HOME/.reelix}"
+
+if [ ! -d "$REELIX_HOME/reelix" ]; then
+    echo "Reelix isn't installed correctly (missing $REELIX_HOME/reelix)." >&2
+    echo "Re-run install.sh from the reelix project." >&2
+    exit 1
+fi
+
+cd "$REELIX_HOME"
+exec python3 -m reelix "$@"

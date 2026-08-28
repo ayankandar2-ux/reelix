@@ -1,0 +1,5 @@
+# Reelix relies on external binaries (ffmpeg, aria2c, yt-dlp, deno) installed via
+# pkg/pip rather than Python packages -- see README.md and install.sh.
+# This file exists for tooling that expects one; there are no pip
+# dependencies beyond the Python 3 standard library (curses, subprocess,
+# threading, json, pathlib, dataclasses).
