@@ -243,6 +243,13 @@ class Download:
         except Empty:
             return None
 
+    def recent_lines(self, n: int) -> list[str]:
+        """Most recent n raw output lines, for a plain scrolling live view
+        of exactly what yt-dlp/aria2c actually printed -- no parsing."""
+        if n <= 0:
+            return []
+        return self._stderr_lines[-n:]
+
     def cancel(self) -> None:
         self._cancelled = True
         if self._proc and self._proc.poll() is None:

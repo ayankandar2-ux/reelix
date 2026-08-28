@@ -478,32 +478,24 @@ def _begin_download(state: AppState, format_selector: str, label: str) -> str:
 
 def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     max_y, max_x = stdscr.getmaxyx()
-    x = ui.center_x(max_x, BOX_WIDTH)
-    y = 1
     dl = state.download
     result = state.last_result or {}
 
-    box_height = 11
-    ui.draw_box(stdscr, y, x, box_height, BOX_WIDTH, title="DOWNLOADING", color_enabled=color_enabled)
+    stdscr.erase()
+
+    header = "Downloading..."
+    ui.safe_addstr(stdscr, 0, 2, header, ui.attr(color_enabled, ui.COLOR_INFO, bold=True))
 
     title = result.get("title", "")
-    if len(title) > BOX_WIDTH - 4:
-        title = title[: BOX_WIDTH - 7] + "..."
-    ui.safe_addstr(stdscr, y + 1, x + 2, title, ui.attr(color_enabled, ui.COLOR_INFO, bold=True))
+    if title:
+        ui.safe_addstr(stdscr, 1, 2, title[: max(0, max_x - 4)], ui.attr(color_enabled, ui.COLOR_MUTED))
 
-    label_attr = ui.attr(color_enabled, ui.COLOR_MUTED)
-    value_attr = ui.attr(color_enabled, ui.COLOR_MUTED)
-    ui.safe_addstr(stdscr, y + 2, x + 2, "Quality", label_attr)
-    ui.safe_addstr(stdscr, y + 2, x + 13, result.get("quality", "-"), value_attr)
-    ui.safe_addstr(stdscr, y + 3, x + 2, "Format", label_attr)
-    ui.safe_addstr(stdscr, y + 3, x + 13, result.get("container", "-"), value_attr)
-
-    # Drain whatever's queued so `dl.done`/error state is current -- the
-    # authoritative progress numbers themselves now live on dl directly
-    # (see Download._apply), updated the instant _pump parses a line, so
-    # a redraw always has the latest known values instead of resetting
-    # to blank whenever this call's poll window doesn't happen to catch
-    # a fresh event.
+    # Drain the queue just to keep dl.done/error current -- we no longer
+    # try to parse percent/speed/ETA into our own custom fields at all.
+    # That parsing was the fragile part; showing the exact same raw text
+    # yt-dlp/aria2c print in a real terminal (which is proven to work,
+    # since that's the whole reason we moved the download itself onto a
+    # pty) sidesteps it entirely.
     stdscr.nodelay(True)
     deadline = time.time() + 0.5
     while time.time() < deadline:
@@ -514,47 +506,14 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
             continue
         if event.kind == "finished":
             break
-        if dl.done and dl.events.empty():
+
+    lines = dl.recent_lines(max(0, max_y - 4))
+    row = 3
+    for line in lines:
+        ui.safe_addstr(stdscr, row, 1, line[: max(0, max_x - 2)], ui.attr(color_enabled, ui.COLOR_MUTED))
+        row += 1
+        if row >= max_y - 1:
             break
-
-    percent = dl.percent
-    downloaded = dl.downloaded_bytes
-    total = dl.total_bytes
-    speed = dl.speed_bytes
-    eta = dl.eta_seconds
-    stage = dl.stage
-
-    if stage == "Downloading" and speed and total and not dl.done:
-        # aria2c only prints roughly once a second -- extrapolate forward
-        # from the last real sample at our own redraw rate so the bar
-        # visibly climbs continuously instead of sitting still and then
-        # jumping straight to the next real number. Purely a display
-        # smoothing pass -- dl's own state is untouched, so a stale guess
-        # can never compound into the real tracked total.
-        elapsed = min(max(0.0, time.monotonic() - dl.last_update_time), 2.0)
-        downloaded = min(total, downloaded + speed * elapsed)
-        percent = (downloaded / total) * 100.0
-
-    if stage == "Starting..." and percent == 0.0:
-        # No status line has arrived yet (still connecting/handshaking).
-        # Show a small animated spinner so the screen visibly changes
-        # instead of sitting dead-still during that gap.
-        spinner = "|/-\\"[int(time.time() * 4) % 4]
-        stage = f"Starting... {spinner}"
-
-    size_line = f"{human_size(downloaded)} / {human_size(total)}" if total else stage
-    ui.safe_addstr(stdscr, y + 5, x + 2, size_line, ui.attr(color_enabled, ui.COLOR_MUTED))
-
-    bar_width = BOX_WIDTH - 12
-    bar = ui.progress_bar(percent, bar_width)
-    bar_attr = ui.attr(color_enabled, ui.COLOR_SUCCESS)
-    ui.safe_addstr(stdscr, y + 6, x + 2, bar, bar_attr)
-    ui.safe_addstr(stdscr, y + 6, x + 3 + bar_width, f"{percent:5.1f}%", ui.attr(color_enabled, ui.COLOR_INFO, bold=True))
-
-    ui.safe_addstr(stdscr, y + 8, x + 2, "Speed", label_attr)
-    ui.safe_addstr(stdscr, y + 8, x + 13, human_speed(speed), value_attr)
-    ui.safe_addstr(stdscr, y + 9, x + 2, "ETA", label_attr)
-    ui.safe_addstr(stdscr, y + 9, x + 13, format_eta(eta), value_attr)
 
     stdscr.refresh()
     stdscr.nodelay(False)
@@ -563,7 +522,7 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
         if dl.error is not None:
             state.error = dl.error
             return "ERROR"
-        state.last_result["size"] = human_size(total) if total else "unknown"
+        state.last_result["size"] = human_size(dl.total_bytes) if dl.total_bytes else "unknown"
         return "COMPLETE"
     return "DOWNLOADING"
 
