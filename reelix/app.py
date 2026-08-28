@@ -507,12 +507,20 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
         if event.kind == "finished":
             break
 
-    lines = dl.recent_lines(max(0, max_y - 4))
-    row = 3
+    box_y = 3
+    box_x = 0
+    box_width = max_x
+    box_height = max(3, max_y - box_y - 1)
+    ui.draw_box(stdscr, box_y, box_x, box_height, box_width, title="LIVE OUTPUT", color_enabled=color_enabled)
+
+    inner_width = box_width - 4
+    visible_rows = box_height - 2
+    lines = dl.recent_lines(max(0, visible_rows))
+    row = box_y + 1
     for line in lines:
-        ui.safe_addstr(stdscr, row, 1, line[: max(0, max_x - 2)], ui.attr(color_enabled, ui.COLOR_MUTED))
+        ui.safe_addstr(stdscr, row, box_x + 2, line[: max(0, inner_width)], ui.attr(color_enabled, ui.COLOR_MUTED))
         row += 1
-        if row >= max_y - 1:
+        if row >= box_y + box_height - 1:
             break
 
     stdscr.refresh()
