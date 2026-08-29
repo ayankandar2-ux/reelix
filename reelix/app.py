@@ -8,6 +8,7 @@ Screen flow:
 from __future__ import annotations
 
 import curses
+import os
 import re
 import sys
 import threading
@@ -58,7 +59,27 @@ def run() -> None:
     if missing:
         _print_dependency_error(missing)
         sys.exit(1)
-    curses.wrapper(_main, config)
+    os.environ.setdefault("ESCDELAY", "25")
+    _set_bracketed_paste(False)
+    try:
+        curses.wrapper(_main, config)
+    finally:
+        _set_bracketed_paste(True)
+
+
+def _set_bracketed_paste(enabled: bool) -> None:
+    """Tell the terminal whether to wrap pasted text in ESC[200~ ... ESC[201~
+    markers. Our curses input loop reads one keystroke at a time and doesn't
+    understand those markers -- when it hits the leading ESC it stalls trying
+    to resolve it as a special key and can swallow the first several
+    characters of a fast paste. Disabling it for the app's session avoids
+    that entirely; it's restored on exit so the shell's own paste handling
+    (e.g. bash's multi-line-safe paste) isn't affected afterward."""
+    try:
+        sys.stdout.write("\x1b[?2004h" if enabled else "\x1b[?2004l")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _print_dependency_error(missing: list[ReelixError]) -> None:
@@ -129,6 +150,47 @@ def _draw_header(stdscr, color_enabled: bool, x: int, y: int) -> int:
     return y + 5
 
 
+def _try_read_bracketed_paste(stdscr) -> str | None:
+    """Called right after reading a raw ESC (27). If the terminal is
+    actually mid-paste and sent a bracketed-paste block despite us asking
+    it not to (ESC[200~ ... ESC[201~), consume the whole thing and hand it
+    back as one string, so it lands in the input buffer atomically instead
+    of being picked apart character-by-character with the leading bytes
+    lost. Returns None if this ESC wasn't actually a paste marker (a plain
+    ESC keypress is simply ignored, as before)."""
+    stdscr.timeout(50)
+    try:
+        for expected in "[200~":
+            if stdscr.getch() != ord(expected):
+                return None
+        payload = []
+        while True:
+            ch = stdscr.getch()
+            if ch == -1:
+                break  # paste stream stalled; return whatever we captured
+            if ch == 27:
+                tail = []
+                is_end = True
+                for expected in "[201~":
+                    c2 = stdscr.getch()
+                    tail.append(c2)
+                    if c2 != ord(expected):
+                        is_end = False
+                        break
+                if is_end:
+                    break
+                payload.append(chr(27))
+                for c2 in tail:
+                    if c2 is not None and 32 <= c2 <= 126:
+                        payload.append(chr(c2))
+                continue
+            if 32 <= ch <= 126:
+                payload.append(chr(ch))
+        return "".join(payload)
+    finally:
+        stdscr.timeout(-1)
+
+
 def _screen_url_input(stdscr, state: AppState, color_enabled: bool) -> str:
     max_y, max_x = stdscr.getmaxyx()
     x = ui.center_x(max_x, BOX_WIDTH)
@@ -152,6 +214,11 @@ def _screen_url_input(stdscr, state: AppState, color_enabled: bool) -> str:
         stdscr.refresh()
 
         ch = stdscr.getch()
+        if ch == 27:
+            pasted = _try_read_bracketed_paste(stdscr)
+            if pasted:
+                buf.extend(pasted)
+            continue
         if ch in (curses.KEY_ENTER, 10, 13):
             text = "".join(buf).strip()
             if not looks_like_url(text):
