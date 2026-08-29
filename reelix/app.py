@@ -662,37 +662,18 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     dl = state.download
     result = state.last_result or {}
 
-    stdscr.erase()
-
+    # Draw the current frame immediately -- right after the main loop's own
+    # erase() -- so the screen is never left blank while we wait below.
+    # Previously the box/lines were only drawn *after* the poll loop, which
+    # meant every ~0.5s pass showed: erase (blank) -> wait -> draw (visible)
+    # -> immediately erased again by the next pass. That erase/wait/draw gap
+    # is exactly what looked like fast on/off flicker.
     header = "Downloading..."
     ui.safe_addstr(stdscr, 0, 2, header, ui.attr(color_enabled, ui.COLOR_INFO, bold=True))
 
     title = result.get("title", "")
     if title:
         ui.safe_addstr(stdscr, 1, 2, title[: max(0, max_x - 4)], ui.attr(color_enabled, ui.COLOR_MUTED))
-
-    # Drain the queue just to keep dl.done/error current -- we no longer
-    # try to parse percent/speed/ETA into our own custom fields at all.
-    # That parsing was the fragile part; showing the exact same raw text
-    # yt-dlp/aria2c print in a real terminal (which is proven to work,
-    # since that's the whole reason we moved the download itself onto a
-    # pty) sidesteps it entirely. Also check for a pause/cancel keypress
-    # each pass through the loop.
-    stdscr.nodelay(True)
-    deadline = time.time() + 0.5
-    while time.time() < deadline:
-        ch = stdscr.getch()
-        if ch in (ord('c'), ord('C')):
-            dl.cancel()
-        elif ch in (ord('p'), ord('P')):
-            dl.toggle_pause()
-        event = dl.poll(timeout=0.1)
-        if event is None:
-            if dl.done:
-                break
-            continue
-        if event.kind == "finished":
-            break
 
     box_y = 3
     box_x = 0
@@ -715,6 +696,25 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     ui.safe_addstr(stdscr, max_y - 1, box_x + 2, footer, ui.attr(color_enabled, ui.COLOR_MUTED))
 
     stdscr.refresh()
+
+    # Now wait/poll for up to 0.5s -- the screen above stays fully drawn and
+    # static the whole time, so nothing flickers. New output that arrives
+    # during this window shows up on the *next* pass, not this one.
+    stdscr.nodelay(True)
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        ch = stdscr.getch()
+        if ch in (ord('c'), ord('C')):
+            dl.cancel()
+        elif ch in (ord('p'), ord('P')):
+            dl.toggle_pause()
+        event = dl.poll(timeout=0.1)
+        if event is None:
+            if dl.done:
+                break
+            continue
+        if event.kind == "finished":
+            break
     stdscr.nodelay(False)
 
     if dl.done:
