@@ -150,6 +150,23 @@ def _draw_header(stdscr, color_enabled: bool, x: int, y: int) -> int:
     return y + 5
 
 
+def _more_input_imminent(stdscr) -> bool:
+    """Peek for a character that's already queued right behind the one we
+    just read. If one shows up almost instantly, we're in the middle of a
+    fast burst (typed-ahead or pasted text) rather than a single deliberate
+    keypress. Any character found is pushed back so the main loop reads it
+    normally on its next pass."""
+    stdscr.timeout(40)
+    try:
+        ch = stdscr.getch()
+    finally:
+        stdscr.timeout(-1)
+    if ch == -1:
+        return False
+    curses.ungetch(ch)
+    return True
+
+
 def _try_read_bracketed_paste(stdscr) -> str | None:
     """Called right after reading a raw ESC (27). If the terminal is
     actually mid-paste and sent a bracketed-paste block despite us asking
@@ -231,11 +248,24 @@ def _screen_url_input(stdscr, state: AppState, color_enabled: bool) -> str:
             if buf:
                 buf.pop()
         elif ch in (ord('h'), ord('H')) and not buf:
-            curses.curs_set(0)
-            return "HISTORY"
-        elif ch in (17, ord('q'), ord('Q')) and not buf:
+            if _more_input_imminent(stdscr):
+                # Another character is already queued right behind this one
+                # -- this is the start of typed/pasted text (e.g. a URL
+                # beginning with "http"), not a deliberate single tap on
+                # the History shortcut. Treat it as ordinary text.
+                buf.append(chr(ch))
+            else:
+                curses.curs_set(0)
+                return "HISTORY"
+        elif ch == 17 and not buf:
             curses.curs_set(0)
             return "QUIT"
+        elif ch in (ord('q'), ord('Q')) and not buf:
+            if _more_input_imminent(stdscr):
+                buf.append(chr(ch))
+            else:
+                curses.curs_set(0)
+                return "QUIT"
         elif 32 <= ch <= 126:
             buf.append(chr(ch))
 
