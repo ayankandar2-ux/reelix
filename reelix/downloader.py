@@ -19,6 +19,7 @@ import fcntl
 import os
 import pty
 import re
+import signal
 import struct
 import subprocess
 import termios
@@ -99,6 +100,7 @@ class Download:
         self._thread: threading.Thread | None = None
         self._stderr_lines: list[str] = []
         self._cancelled = False
+        self.paused = False
 
     def _build_command(self) -> list[str]:
         # yt-dlp needs the output template's extension placeholder; the
@@ -150,6 +152,7 @@ class Download:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
+                start_new_session=True,
             )
             os.close(slave_fd)
             self._master_fd = master_fd
@@ -277,4 +280,37 @@ class Download:
     def cancel(self) -> None:
         self._cancelled = True
         if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+            try:
+                # SIGTERM to the whole process group, not just yt-dlp
+                # itself -- yt-dlp spawns aria2c as a child, and a signal
+                # to yt-dlp alone wouldn't reach it, leaving the actual
+                # download running in the background.
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+            except OSError:
+                self._proc.terminate()
+
+    def pause(self) -> None:
+        if self._proc and self._proc.poll() is None and not self.paused:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGSTOP)
+                self.paused = True
+            except OSError:
+                pass
+
+    def resume(self) -> None:
+        if self._proc and self._proc.poll() is None and self.paused:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGCONT)
+                self.paused = False
+            except OSError:
+                pass
+
+    def toggle_pause(self) -> None:
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled

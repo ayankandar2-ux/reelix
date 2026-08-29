@@ -44,7 +44,7 @@ def ensure_download_dir(path: str) -> Path:
 
 
 def _writable(directory: Path) -> bool:
-    probe = directory / ".vd_write_test"
+    probe = directory / ".reelix_write_test"
     try:
         probe.touch(exist_ok=True)
         probe.unlink()

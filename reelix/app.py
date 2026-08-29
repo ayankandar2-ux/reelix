@@ -15,10 +15,12 @@ import time
 from pathlib import Path
 
 from . import formats as fmt_module
+from . import history
 from . import metadata
 from . import sizeprobe
 from . import storage
 from . import ui
+from . import updatecheck
 from .config import load_config, save_config
 from .downloader import Download
 from .errors import ReelixError, check_dependencies
@@ -26,6 +28,7 @@ from .utils import format_duration, format_eta, human_size, human_speed, looks_l
 
 BOX_WIDTH = 56
 ADVANCED_PROBE_MAX_WAIT = 3.0  # seconds we'll auto-refresh the screen while probing
+MAX_AUTO_RETRIES = 2
 
 
 class AppState:
@@ -41,6 +44,10 @@ class AppState:
         self.download: Download | None = None
         self.debug = config.get("debug", False)
         self.last_result: dict | None = None
+        self.last_format_selector: str = ""
+        self.retry_count = 0
+        self.history_index = 0
+        self.update_notice: str | None = None
         self.advanced_probe_started = False
         self.advanced_probe_thread: threading.Thread | None = None
 
@@ -71,12 +78,15 @@ def _main(stdscr, config: dict) -> None:
     color_enabled = ui.init_colors(config.get("color_enabled", True))
 
     state = AppState(config)
+    threading.Thread(target=_check_update_background, args=(state,), daemon=True).start()
     screen = "URL_INPUT"
 
     while True:
         stdscr.erase()
         if screen == "URL_INPUT":
             screen = _screen_url_input(stdscr, state, color_enabled)
+        elif screen == "HISTORY":
+            screen = _screen_history(stdscr, state, color_enabled)
         elif screen == "FETCHING":
             screen = _screen_fetching(stdscr, state, color_enabled)
         elif screen == "QUALITY_SELECT":
@@ -93,6 +103,15 @@ def _main(stdscr, config: dict) -> None:
             return
         else:
             return
+
+
+def _check_update_background(state: AppState) -> None:
+    try:
+        remote = updatecheck.check_for_update()
+    except Exception:
+        remote = None
+    if remote:
+        state.update_notice = f"Update available: v{remote} (you have v{updatecheck.local_version()})"
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +136,9 @@ def _screen_url_input(stdscr, state: AppState, color_enabled: bool) -> str:
 
     ui.safe_addstr(stdscr, y, x, "Paste video URL", ui.attr(color_enabled, ui.COLOR_INFO, bold=True))
     ui.safe_addstr(stdscr, y + 1, x, "\u2500" * BOX_WIDTH, ui.attr(color_enabled, ui.COLOR_MUTED))
-    ui.safe_addstr(stdscr, y + 3, x, "[Enter] Fetch   [Q] Quit", ui.attr(color_enabled, ui.COLOR_MUTED))
+    ui.safe_addstr(stdscr, y + 3, x, "[Enter] Fetch   [H] History   [Q] Quit", ui.attr(color_enabled, ui.COLOR_MUTED))
+    if state.update_notice:
+        ui.safe_addstr(stdscr, y + 5, x, state.update_notice[:BOX_WIDTH], ui.attr(color_enabled, ui.COLOR_INFO))
     stdscr.refresh()
 
     curses.curs_set(1)
@@ -142,6 +163,9 @@ def _screen_url_input(stdscr, state: AppState, color_enabled: bool) -> str:
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if buf:
                 buf.pop()
+        elif ch in (ord('h'), ord('H')) and not buf:
+            curses.curs_set(0)
+            return "HISTORY"
         elif ch in (17, ord('q'), ord('Q')) and not buf:
             curses.curs_set(0)
             return "QUIT"
@@ -154,6 +178,65 @@ def _flash_message(stdscr, y: int, x: int, text: str, pair: int, color_enabled: 
     stdscr.refresh()
     time.sleep(1.1)
     ui.safe_addstr(stdscr, y, x, " " * len(text), curses.A_NORMAL)
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
+def _screen_history(stdscr, state: AppState, color_enabled: bool) -> str:
+    max_y, max_x = stdscr.getmaxyx()
+    x = ui.center_x(max_x, BOX_WIDTH)
+    y = 1
+    entries = history.load_history()
+
+    box_height = max(4, min(max_y - y - 2, 4 + max(1, len(entries))))
+    ui.draw_box(stdscr, y, x, box_height, BOX_WIDTH, title="DOWNLOAD HISTORY", color_enabled=color_enabled)
+
+    label_attr = ui.attr(color_enabled, ui.COLOR_MUTED)
+    if not entries:
+        ui.safe_addstr(stdscr, y + 2, x + 2, "No downloads yet.", label_attr)
+    else:
+        if state.history_index >= len(entries):
+            state.history_index = len(entries) - 1
+        if state.history_index < 0:
+            state.history_index = 0
+        visible_rows = box_height - 2
+        start = max(0, min(state.history_index - visible_rows // 2, max(0, len(entries) - visible_rows)))
+        row = y + 1
+        for i in range(start, min(start + visible_rows, len(entries))):
+            entry = entries[i]
+            selected = i == state.history_index
+            marker = "\u25b8 " if selected else "  "
+            when = entry.get("when", "")[:10]
+            title = entry.get("title", "")
+            quality = entry.get("quality", "")
+            budget = BOX_WIDTH - 4 - len(marker) - len(quality) - len(when) - 4
+            if len(title) > budget:
+                title = title[: max(0, budget - 1)] + "\u2026"
+            line = f"{marker}{title}  {quality}  {when}"
+            attr = ui.attr(color_enabled, ui.COLOR_SUCCESS, bold=selected) if selected else label_attr
+            ui.safe_addstr(stdscr, row, x + 1, line[: BOX_WIDTH - 2], attr)
+            row += 1
+
+    ui.safe_addstr(stdscr, y + box_height, x + 2, "[\u2191\u2193] Select  [Enter] Re-download  [B] Back  [Q] Quit", label_attr)
+    stdscr.refresh()
+
+    ch = stdscr.getch()
+    if ch in (curses.KEY_UP, ord('k')):
+        state.history_index = max(0, state.history_index - 1)
+    elif ch in (curses.KEY_DOWN, ord('j')):
+        state.history_index = min(max(0, len(entries) - 1), state.history_index + 1)
+    elif ch in (curses.KEY_ENTER, 10, 13) and entries:
+        entry = entries[state.history_index]
+        state.url = entry.get("url", "")
+        state.info = None
+        return "FETCHING" if state.url else "HISTORY"
+    elif ch in (ord('b'), ord('B'), 27):
+        return "URL_INPUT"
+    elif ch in (ord('q'), ord('Q')):
+        return "QUIT"
+    return "HISTORY"
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +555,7 @@ def _begin_download(state: AppState, format_selector: str, label: str) -> str:
     )
     state.download = dl
     state.last_result = {"title": title, "quality": label, "container": container.upper(), "dest": str(directory)}
+    state.last_format_selector = format_selector
     dl.start()
     return "DOWNLOADING"
 
@@ -495,10 +579,16 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     # That parsing was the fragile part; showing the exact same raw text
     # yt-dlp/aria2c print in a real terminal (which is proven to work,
     # since that's the whole reason we moved the download itself onto a
-    # pty) sidesteps it entirely.
+    # pty) sidesteps it entirely. Also check for a pause/cancel keypress
+    # each pass through the loop.
     stdscr.nodelay(True)
     deadline = time.time() + 0.5
     while time.time() < deadline:
+        ch = stdscr.getch()
+        if ch in (ord('c'), ord('C')):
+            dl.cancel()
+        elif ch in (ord('p'), ord('P')):
+            dl.toggle_pause()
         event = dl.poll(timeout=0.1)
         if event is None:
             if dl.done:
@@ -510,8 +600,9 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
     box_y = 3
     box_x = 0
     box_width = max_x
-    box_height = max(3, max_y - box_y - 1)
-    ui.draw_box(stdscr, box_y, box_x, box_height, box_width, title="LIVE OUTPUT", color_enabled=color_enabled)
+    box_height = max(3, max_y - box_y - 2)
+    box_title = "LIVE OUTPUT (PAUSED)" if dl.paused else "LIVE OUTPUT"
+    ui.draw_box(stdscr, box_y, box_x, box_height, box_width, title=box_title, color_enabled=color_enabled)
 
     inner_width = box_width - 4
     visible_rows = box_height - 2
@@ -523,14 +614,46 @@ def _screen_downloading(stdscr, state: AppState, color_enabled: bool) -> str:
         if row >= box_y + box_height - 1:
             break
 
+    footer = "[P] Pause/Resume   [C] Cancel"
+    ui.safe_addstr(stdscr, max_y - 1, box_x + 2, footer, ui.attr(color_enabled, ui.COLOR_MUTED))
+
     stdscr.refresh()
     stdscr.nodelay(False)
 
     if dl.done:
+        if dl.cancelled:
+            state.url = ""
+            state.info = None
+            state.retry_count = 0
+            return "URL_INPUT"
         if dl.error is not None:
+            if state.retry_count < MAX_AUTO_RETRIES:
+                state.retry_count += 1
+                try:
+                    if dl.dest_path.exists():
+                        dl.dest_path.unlink()
+                except OSError:
+                    pass
+                _flash_message(
+                    stdscr, max_y - 1, box_x + 2,
+                    f"Download failed -- retrying ({state.retry_count}/{MAX_AUTO_RETRIES})...",
+                    ui.COLOR_ERROR, color_enabled,
+                )
+                return _begin_download(state, state.last_format_selector, result.get("quality", ""))
+            state.retry_count = 0
             state.error = dl.error
             return "ERROR"
-        state.last_result["size"] = human_size(dl.total_bytes) if dl.total_bytes else "unknown"
+        state.retry_count = 0
+        size = human_size(dl.total_bytes) if dl.total_bytes else "unknown"
+        state.last_result["size"] = size
+        history.add_entry(history.entry_now(
+            url=state.url,
+            title=result.get("title", ""),
+            quality=result.get("quality", ""),
+            container=result.get("container", ""),
+            size=size,
+            dest=result.get("dest", ""),
+        ))
         return "COMPLETE"
     return "DOWNLOADING"
 
@@ -605,6 +728,7 @@ def _screen_error(stdscr, state: AppState, color_enabled: bool) -> str:
 
     ch = stdscr.getch()
     if ch in (ord('r'), ord('R')) and state.url:
+        state.retry_count = 0
         return "FETCHING"
     elif ch in (ord('n'), ord('N')):
         state.url = ""
